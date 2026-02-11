@@ -7,6 +7,9 @@
     <style>
       :root {
         --bg: #101018;
+        --glow: transparent;
+        --vibe-color: #8aa7ff;
+        --pulse: 1;
         --card: rgba(255, 255, 255, 0.08);
         --text: rgba(255, 255, 255, 0.92);
         --muted: rgba(255, 255, 255, 0.7);
@@ -42,10 +45,23 @@
         pointer-events: none;
       }
 
+      #visualizer {
+        position: fixed;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        z-index: 0;
+        pointer-events: none;
+      }
+
       .wrap {
         max-width: 900px;
         margin: 0 auto;
         padding: 28px 18px 60px;
+        position: relative;
+        z-index: 1;
+        transform: scale(var(--pulse, 1));
+        transition: transform 180ms ease-out;
       }
 
       h1 {
@@ -172,6 +188,7 @@
     </style>
   </head>
   <body>
+    <canvas id="visualizer"></canvas>
     <div class="wrap">
       <h1>VibeCheck</h1>
       <p class="sub">Record 10 seconds → identify the track → get similar songs + top tags → update the mood board.</p>
@@ -205,6 +222,14 @@
       const recsEl = document.getElementById('recs');
       const errorEl = document.getElementById('error');
       const tagsPill = document.getElementById('tagsPill');
+      const canvas = document.getElementById('visualizer');
+      const ctx = canvas.getContext('2d');
+
+      let audioCtx = null;
+      let analyser = null;
+      let dataArray = null;
+      let animationId = null;
+      let recordingActive = false;
 
       function setStatus(text) {
         statusEl.textContent = text;
@@ -220,6 +245,121 @@
         errorEl.textContent = '';
       }
 
+      function resizeCanvas() {
+        const dpr = Math.max(1, window.devicePixelRatio || 1);
+        canvas.width = Math.floor(window.innerWidth * dpr);
+        canvas.height = Math.floor(window.innerHeight * dpr);
+        canvas.style.width = `${window.innerWidth}px`;
+        canvas.style.height = `${window.innerHeight}px`;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      }
+
+      function getVibeColor() {
+        const color = getComputedStyle(document.documentElement).getPropertyValue('--vibe-color').trim();
+        return color || '#8aa7ff';
+      }
+
+      function startVisualizer(stream) {
+        if (recordingActive) return;
+
+        recordingActive = true;
+        resizeCanvas();
+
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 1024;
+        analyser.smoothingTimeConstant = 0.82;
+        const source = audioCtx.createMediaStreamSource(stream);
+        source.connect(analyser);
+
+        dataArray = new Uint8Array(analyser.frequencyBinCount);
+        animationId = requestAnimationFrame(animate);
+      }
+
+      function stopVisualizer() {
+        recordingActive = false;
+        if (animationId) cancelAnimationFrame(animationId);
+        animationId = null;
+        if (audioCtx) {
+          audioCtx.close();
+          audioCtx = null;
+        }
+        analyser = null;
+        dataArray = null;
+        document.documentElement.style.setProperty('--pulse', '1');
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+      }
+
+      function animate(t) {
+        if (!recordingActive || !analyser || !dataArray) return;
+
+        analyser.getByteFrequencyData(dataArray);
+
+        const len = dataArray.length;
+        let sum = 0;
+        for (let i = 0; i < len; i += 1) sum += dataArray[i];
+        const avg = sum / len;
+
+        const bassCount = Math.max(6, Math.floor(len * 0.12));
+        const trebleStart = Math.floor(len * 0.75);
+        let bassSum = 0;
+        let trebleSum = 0;
+
+        for (let i = 0; i < bassCount; i += 1) bassSum += dataArray[i];
+        for (let i = trebleStart; i < len; i += 1) trebleSum += dataArray[i];
+
+        const bassAvg = bassSum / bassCount;
+        const trebleAvg = trebleSum / Math.max(1, len - trebleStart);
+
+        const avgNorm = avg / 255;
+        const bassNorm = bassAvg / 255;
+        const trebleNorm = trebleAvg / 255;
+
+        const scale = 0.98 + avgNorm * 0.03 + bassNorm * 0.04;
+        document.documentElement.style.setProperty('--pulse', scale.toFixed(3));
+
+        const w = canvas.width / (window.devicePixelRatio || 1);
+        const h = canvas.height / (window.devicePixelRatio || 1);
+        ctx.clearRect(0, 0, w, h);
+
+        const cx = w / 2;
+        const cy = h / 2;
+        const radius = Math.min(w, h) * 0.18;
+        const bars = 90;
+        const step = Math.floor(len / bars);
+        const speed = 0.0015 + trebleNorm * 0.004;
+        const time = t * speed;
+        const vibeColor = getVibeColor();
+
+        ctx.strokeStyle = vibeColor;
+        ctx.lineWidth = 2;
+        ctx.globalAlpha = 0.85;
+
+        for (let i = 0; i < bars; i += 1) {
+          const v = dataArray[i * step] / 255;
+          const barLen = 14 + v * (40 + trebleNorm * 80);
+          const angle = (i / bars) * Math.PI * 2 + time;
+          const x1 = cx + Math.cos(angle) * radius;
+          const y1 = cy + Math.sin(angle) * radius;
+          const x2 = cx + Math.cos(angle) * (radius + barLen);
+          const y2 = cy + Math.sin(angle) * (radius + barLen);
+          ctx.beginPath();
+          ctx.moveTo(x1, y1);
+          ctx.lineTo(x2, y2);
+          ctx.stroke();
+        }
+
+        ctx.beginPath();
+        ctx.globalAlpha = 0.5;
+        ctx.lineWidth = 1.5 + trebleNorm * 2;
+        ctx.arc(cx, cy, radius * (1 + bassNorm * 0.06), 0, Math.PI * 2);
+        ctx.stroke();
+
+        animationId = requestAnimationFrame(animate);
+      }
+
+      window.addEventListener('resize', resizeCanvas);
+
       function updateVibe(tags) {
         /*
          * Professional vibe mapping: each genre maps to a
@@ -227,28 +367,28 @@
          * that pulses behind the page via the body::before animation.
          */
         const vibes = {
-          electronic:  { bg: 'linear-gradient(135deg, #0f0024 0%, #3a007d 40%, #7b2ff7 100%)', glow: 'radial-gradient(circle, rgba(123,47,247,0.6), transparent 70%)' },
-          chill:       { bg: 'linear-gradient(135deg, #0b1e3d 0%, #1b4f72 40%, #5dade2 100%)', glow: 'radial-gradient(circle, rgba(93,173,226,0.5), transparent 70%)' },
-          acoustic:    { bg: 'linear-gradient(135deg, #0a1f0a 0%, #1b5e20 40%, #4caf50 100%)', glow: 'radial-gradient(circle, rgba(76,175,80,0.45), transparent 70%)' },
-          rock:        { bg: 'linear-gradient(135deg, #1a0000 0%, #6d0000 40%, #d32f2f 100%)', glow: 'radial-gradient(circle, rgba(211,47,47,0.5), transparent 70%)' },
-          pop:         { bg: 'linear-gradient(135deg, #1a0033 0%, #8e24aa 40%, #f06292 100%)', glow: 'radial-gradient(circle, rgba(240,98,146,0.5), transparent 70%)' },
-          jazz:        { bg: 'linear-gradient(135deg, #1a1000 0%, #4e342e 40%, #d4a056 100%)', glow: 'radial-gradient(circle, rgba(212,160,86,0.45), transparent 70%)' },
-          hiphop:      { bg: 'linear-gradient(135deg, #0d0d0d 0%, #37474f 40%, #ff6f00 100%)', glow: 'radial-gradient(circle, rgba(255,111,0,0.45), transparent 70%)' },
-          'hip-hop':   { bg: 'linear-gradient(135deg, #0d0d0d 0%, #37474f 40%, #ff6f00 100%)', glow: 'radial-gradient(circle, rgba(255,111,0,0.45), transparent 70%)' },
-          rnb:         { bg: 'linear-gradient(135deg, #120024 0%, #4a148c 40%, #ce93d8 100%)', glow: 'radial-gradient(circle, rgba(206,147,216,0.45), transparent 70%)' },
-          'r&b':       { bg: 'linear-gradient(135deg, #120024 0%, #4a148c 40%, #ce93d8 100%)', glow: 'radial-gradient(circle, rgba(206,147,216,0.45), transparent 70%)' },
-          classical:   { bg: 'linear-gradient(135deg, #0d0d1a 0%, #1a237e 40%, #9fa8da 100%)', glow: 'radial-gradient(circle, rgba(159,168,218,0.4), transparent 70%)' },
-          metal:       { bg: 'linear-gradient(135deg, #0a0a0a 0%, #212121 40%, #616161 100%)', glow: 'radial-gradient(circle, rgba(97,97,97,0.5), transparent 70%)' },
-          country:     { bg: 'linear-gradient(135deg, #1b1200 0%, #795548 40%, #ffcc80 100%)', glow: 'radial-gradient(circle, rgba(255,204,128,0.45), transparent 70%)' },
-          soul:        { bg: 'linear-gradient(135deg, #1a0a00 0%, #bf360c 40%, #ffab91 100%)', glow: 'radial-gradient(circle, rgba(255,171,145,0.45), transparent 70%)' },
-          funk:        { bg: 'linear-gradient(135deg, #1a0033 0%, #6a1b9a 40%, #ffd600 100%)', glow: 'radial-gradient(circle, rgba(255,214,0,0.45), transparent 70%)' },
-          reggae:      { bg: 'linear-gradient(135deg, #0a1f0a 0%, #1b5e20 40%, #fdd835 100%)', glow: 'radial-gradient(circle, rgba(253,216,53,0.4), transparent 70%)' },
-          blues:       { bg: 'linear-gradient(135deg, #0d1b2a 0%, #1565c0 40%, #90caf9 100%)', glow: 'radial-gradient(circle, rgba(144,202,249,0.45), transparent 70%)' },
-          indie:       { bg: 'linear-gradient(135deg, #1a1a2e 0%, #16213e 40%, #e94560 100%)', glow: 'radial-gradient(circle, rgba(233,69,96,0.45), transparent 70%)' },
-          ambient:     { bg: 'linear-gradient(135deg, #000a12 0%, #01579b 40%, #4fc3f7 100%)', glow: 'radial-gradient(circle, rgba(79,195,247,0.35), transparent 70%)' },
-          dance:       { bg: 'linear-gradient(135deg, #0f0024 0%, #aa00ff 40%, #ea80fc 100%)', glow: 'radial-gradient(circle, rgba(234,128,252,0.5), transparent 70%)' },
-          latin:       { bg: 'linear-gradient(135deg, #1a0000 0%, #c62828 40%, #ffab00 100%)', glow: 'radial-gradient(circle, rgba(255,171,0,0.5), transparent 70%)' },
-          punk:        { bg: 'linear-gradient(135deg, #0a0a0a 0%, #212121 40%, #76ff03 100%)', glow: 'radial-gradient(circle, rgba(118,255,3,0.4), transparent 70%)' },
+          electronic:  { bg: 'linear-gradient(135deg, #0f0024 0%, #3a007d 40%, #7b2ff7 100%)', glow: 'radial-gradient(circle, rgba(123,47,247,0.6), transparent 70%)', color: '#a884ff' },
+          chill:       { bg: 'linear-gradient(135deg, #0b1e3d 0%, #1b4f72 40%, #5dade2 100%)', glow: 'radial-gradient(circle, rgba(93,173,226,0.5), transparent 70%)', color: '#7dc8ff' },
+          acoustic:    { bg: 'linear-gradient(135deg, #0a1f0a 0%, #1b5e20 40%, #4caf50 100%)', glow: 'radial-gradient(circle, rgba(76,175,80,0.45), transparent 70%)', color: '#6fd07b' },
+          rock:        { bg: 'linear-gradient(135deg, #1a0000 0%, #6d0000 40%, #d32f2f 100%)', glow: 'radial-gradient(circle, rgba(211,47,47,0.5), transparent 70%)', color: '#ff5a5a' },
+          pop:         { bg: 'linear-gradient(135deg, #1a0033 0%, #8e24aa 40%, #f06292 100%)', glow: 'radial-gradient(circle, rgba(240,98,146,0.5), transparent 70%)', color: '#ff8db6' },
+          jazz:        { bg: 'linear-gradient(135deg, #1a1000 0%, #4e342e 40%, #d4a056 100%)', glow: 'radial-gradient(circle, rgba(212,160,86,0.45), transparent 70%)', color: '#f2c17b' },
+          hiphop:      { bg: 'linear-gradient(135deg, #0d0d0d 0%, #37474f 40%, #ff6f00 100%)', glow: 'radial-gradient(circle, rgba(255,111,0,0.45), transparent 70%)', color: '#ff8f3a' },
+          'hip-hop':   { bg: 'linear-gradient(135deg, #0d0d0d 0%, #37474f 40%, #ff6f00 100%)', glow: 'radial-gradient(circle, rgba(255,111,0,0.45), transparent 70%)', color: '#ff8f3a' },
+          rnb:         { bg: 'linear-gradient(135deg, #120024 0%, #4a148c 40%, #ce93d8 100%)', glow: 'radial-gradient(circle, rgba(206,147,216,0.45), transparent 70%)', color: '#e0a7f2' },
+          'r&b':       { bg: 'linear-gradient(135deg, #120024 0%, #4a148c 40%, #ce93d8 100%)', glow: 'radial-gradient(circle, rgba(206,147,216,0.45), transparent 70%)', color: '#e0a7f2' },
+          classical:   { bg: 'linear-gradient(135deg, #0d0d1a 0%, #1a237e 40%, #9fa8da 100%)', glow: 'radial-gradient(circle, rgba(159,168,218,0.4), transparent 70%)', color: '#b8c1ff' },
+          metal:       { bg: 'linear-gradient(135deg, #0a0a0a 0%, #212121 40%, #616161 100%)', glow: 'radial-gradient(circle, rgba(97,97,97,0.5), transparent 70%)', color: '#b0b0b0' },
+          country:     { bg: 'linear-gradient(135deg, #1b1200 0%, #795548 40%, #ffcc80 100%)', glow: 'radial-gradient(circle, rgba(255,204,128,0.45), transparent 70%)', color: '#ffd59b' },
+          soul:        { bg: 'linear-gradient(135deg, #1a0a00 0%, #bf360c 40%, #ffab91 100%)', glow: 'radial-gradient(circle, rgba(255,171,145,0.45), transparent 70%)', color: '#ffb9a3' },
+          funk:        { bg: 'linear-gradient(135deg, #1a0033 0%, #6a1b9a 40%, #ffd600 100%)', glow: 'radial-gradient(circle, rgba(255,214,0,0.45), transparent 70%)', color: '#ffe263' },
+          reggae:      { bg: 'linear-gradient(135deg, #0a1f0a 0%, #1b5e20 40%, #fdd835 100%)', glow: 'radial-gradient(circle, rgba(253,216,53,0.4), transparent 70%)', color: '#ffe36f' },
+          blues:       { bg: 'linear-gradient(135deg, #0d1b2a 0%, #1565c0 40%, #90caf9 100%)', glow: 'radial-gradient(circle, rgba(144,202,249,0.45), transparent 70%)', color: '#a8d4ff' },
+          indie:       { bg: 'linear-gradient(135deg, #1a1a2e 0%, #16213e 40%, #e94560 100%)', glow: 'radial-gradient(circle, rgba(233,69,96,0.45), transparent 70%)', color: '#ff7b92' },
+          ambient:     { bg: 'linear-gradient(135deg, #000a12 0%, #01579b 40%, #4fc3f7 100%)', glow: 'radial-gradient(circle, rgba(79,195,247,0.35), transparent 70%)', color: '#8bdcff' },
+          dance:       { bg: 'linear-gradient(135deg, #0f0024 0%, #aa00ff 40%, #ea80fc 100%)', glow: 'radial-gradient(circle, rgba(234,128,252,0.5), transparent 70%)', color: '#f2a2ff' },
+          latin:       { bg: 'linear-gradient(135deg, #1a0000 0%, #c62828 40%, #ffab00 100%)', glow: 'radial-gradient(circle, rgba(255,171,0,0.5), transparent 70%)', color: '#ffc04d' },
+          punk:        { bg: 'linear-gradient(135deg, #0a0a0a 0%, #212121 40%, #76ff03 100%)', glow: 'radial-gradient(circle, rgba(118,255,3,0.4), transparent 70%)', color: '#b7ff5c' },
         };
 
         const normalized = (Array.isArray(tags) ? tags : [])
@@ -263,6 +403,7 @@
         if (!chosen) {
           document.documentElement.style.setProperty('--bg', '#101018');
           document.documentElement.style.setProperty('--glow', 'transparent');
+          document.documentElement.style.setProperty('--vibe-color', '#8aa7ff');
           tagsPill.style.display = 'none';
           tagsPill.textContent = '';
           return;
@@ -270,6 +411,7 @@
 
         document.documentElement.style.setProperty('--bg', chosen.bg);
         document.documentElement.style.setProperty('--glow', chosen.glow);
+        document.documentElement.style.setProperty('--vibe-color', chosen.color || '#8aa7ff');
         tagsPill.style.display = 'inline-block';
         tagsPill.textContent = `Top tags: ${normalized.slice(0, 3).join(', ')}`;
       }
@@ -295,6 +437,7 @@
           recorder.onstop = resolve;
         });
 
+        startVisualizer(stream);
         recorder.start();
         setStatus('Recording…');
 
@@ -302,6 +445,7 @@
         recorder.stop();
 
         await stopped;
+        stopVisualizer();
         stream.getTracks().forEach(t => t.stop());
 
         const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });

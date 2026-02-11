@@ -6,24 +6,33 @@
 
 1. **Record** — Click "Record (10s)" to capture audio from your microphone.
 2. **Identify** — The audio is sent to [ACRCloud](https://www.acrcloud.com/) for music recognition.
-3. **Discover** — The identified track is looked up on [Last.fm](https://www.last.fm/) to fetch 5 similar songs and the top 3 genre/mood tags.
-4. **Vibe** — The page background smoothly transitions to a gradient + animated glow that matches the detected genre (electronic → neon purple, chill → sky blue, rock → deep red, and 20+ more).
+3. **Discover** — The identified track is looked up on [Last.fm](https://www.last.fm/) to fetch 5 recommended tracks and the top 3 genre/mood tags.
+4. **Vibe** — The page background smoothly transitions to a genre-matched gradient + animated glow (20+ genre mappings).
+5. **Visualize** — While recording, a full-screen canvas visualizer draws a circular frequency ring using the Web Audio API.
 
 Each recommended track includes a **▶ YouTube** link for one-click listening.
+
+## Features
+
+- **One-click discovery**: YouTube search link per recommendation.
+- **Smart recommendations**: If `track.getSimilar` is empty, the backend falls back to similar artists and/or tag-based top tracks.
+- **Mood board**: Genre-driven gradients + glow.
+- **Mic visualizer**: Circular spectrum ring (active only while recording).
+- **Audio-driven motion**: Average frequency subtly scales the UI container; bass/treble influence pulse + bar height/speed.
 
 ## Tech Stack
 
 | Layer    | Technology |
 |----------|------------|
-| Frontend | HTML5, CSS (dynamic variables, transitions, keyframe glow), vanilla JavaScript (MediaRecorder API) |
+| Frontend | HTML5, CSS (dynamic variables, transitions, keyframe glow), vanilla JavaScript (MediaRecorder + Web Audio API + Canvas) |
 | Backend  | Python / Flask |
-| APIs     | ACRCloud (music recognition), Last.fm (`track.getSimilar`, `track.getTopTags`) |
+| APIs     | ACRCloud (music recognition), Last.fm (`track.getSimilar`, `track.getTopTags`, plus fallbacks: `artist.getSimilar`, `artist.getTopTracks`, `tag.getTopTracks`) |
 
 ## Quick Start
 
 ```bash
 # 1. Clone the repo
-git clone https://github.com/<your-username>/VibeCheck.git
+git clone https://github.com/Kinshuk699/VibeCheck.git
 cd VibeCheck
 
 # 2. Create & activate a virtual environment
@@ -58,7 +67,7 @@ See [`.env.example`](.env.example) for the template.
 
 ```
 ├── app.py            # Flask backend (/identify route + ACRCloud & Last.fm logic)
-├── index.html        # Single-page frontend (recorder, results, vibe mapping)
+├── index.html        # Single-page frontend (recorder, canvas visualizer, results, vibe mapping)
 ├── .env.example      # Template for API keys
 ├── .env              # Your local keys (git-ignored)
 ├── .gitignore
