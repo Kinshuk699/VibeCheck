@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>VibeCheck</title>
+    <style>
+      :root {
+        --bg: #101018;
+        --card: rgba(255, 255, 255, 0.08);
+        --text: rgba(255, 255, 255, 0.92);
+        --muted: rgba(255, 255, 255, 0.7);
+        --border: rgba(255, 255, 255, 0.16);
+      }
+
+      * { box-sizing: border-box; }
+
+      @keyframes vibeGlow {
+        0%, 100% { opacity: 0.5; transform: scale(1); }
+        50%      { opacity: 0.85; transform: scale(1.08); }
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji",
+          "Segoe UI Emoji";
+        color: var(--text);
+        background: var(--bg);
+        transition: background 1.2s ease;
+        overflow-x: hidden;
+      }
+
+      body::before {
+        content: '';
+        position: fixed;
+        inset: -40%;
+        z-index: -1;
+        background: var(--glow, transparent);
+        filter: blur(120px);
+        animation: vibeGlow 6s ease-in-out infinite;
+        pointer-events: none;
+      }
+
+      .wrap {
+        max-width: 900px;
+        margin: 0 auto;
+        padding: 28px 18px 60px;
+      }
+
+      h1 {
+        margin: 0 0 14px;
+        font-size: 28px;
+        letter-spacing: 0.2px;
+      }
+
+      .sub {
+        margin: 0 0 22px;
+        color: var(--muted);
+        line-height: 1.4;
+      }
+
+      .row {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        flex-wrap: wrap;
+        margin-bottom: 18px;
+      }
+
+      button {
+        appearance: none;
+        border: 1px solid var(--border);
+        background: rgba(255, 255, 255, 0.10);
+        color: var(--text);
+        padding: 10px 14px;
+        border-radius: 10px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+
+      button:disabled {
+        opacity: 0.55;
+        cursor: not-allowed;
+      }
+
+      .pill {
+        border: 1px solid var(--border);
+        background: rgba(255, 255, 255, 0.06);
+        padding: 8px 10px;
+        border-radius: 999px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 14px;
+      }
+
+      @media (min-width: 860px) {
+        .grid {
+          grid-template-columns: 1fr 1fr;
+        }
+      }
+
+      .card {
+        border: 1px solid var(--border);
+        background: var(--card);
+        border-radius: 14px;
+        padding: 14px 14px 16px;
+      }
+
+      .label {
+        font-size: 13px;
+        color: var(--muted);
+        margin: 0 0 8px;
+      }
+
+      .value {
+        margin: 0;
+        font-size: 16px;
+        line-height: 1.4;
+      }
+
+      .list {
+        margin: 0;
+        padding-left: 18px;
+        color: var(--text);
+      }
+
+      .list li {
+        margin: 6px 0;
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+
+      a { color: var(--text); }
+      a:hover { opacity: 0.9; }
+
+      .yt-link {
+        display: inline-flex;
+        align-items: center;
+        gap: 3px;
+        font-size: 12px;
+        color: #ff4e45;
+        text-decoration: none;
+        opacity: 0.85;
+        white-space: nowrap;
+      }
+      .yt-link:hover { opacity: 1; }
+
+      .err {
+        margin-top: 14px;
+        color: #ffd1d1;
+        background: rgba(255, 0, 0, 0.12);
+        border: 1px solid rgba(255, 0, 0, 0.28);
+        padding: 10px 12px;
+        border-radius: 12px;
+        display: none;
+        white-space: pre-wrap;
+      }
+
+      .hint {
+        color: var(--muted);
+        font-size: 13px;
+        margin-top: 8px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <h1>VibeCheck</h1>
+      <p class="sub">Record 10 seconds → identify the track → get similar songs + top tags → update the mood board.</p>
+
+      <div class="row">
+        <button id="recordBtn">Record (10s)</button>
+        <span id="status" class="pill">Idle</span>
+        <span id="tagsPill" class="pill" style="display:none;"></span>
+      </div>
+
+      <div class="grid">
+        <div class="card">
+          <p class="label">Identified Song</p>
+          <p id="identified" class="value">—</p>
+          <p class="hint">Tip: allow microphone permission when prompted.</p>
+        </div>
+
+        <div class="card">
+          <p class="label">Recommended Tracks</p>
+          <ol id="recs" class="list"></ol>
+        </div>
+      </div>
+
+      <div id="error" class="err"></div>
+    </div>
+
+    <script>
+      const recordBtn = document.getElementById('recordBtn');
+      const statusEl = document.getElementById('status');
+      const identifiedEl = document.getElementById('identified');
+      const recsEl = document.getElementById('recs');
+      const errorEl = document.getElementById('error');
+      const tagsPill = document.getElementById('tagsPill');
+
+      function setStatus(text) {
+        statusEl.textContent = text;
+      }
+
+      function showError(message) {
+        errorEl.style.display = 'block';
+        errorEl.textContent = message;
+      }
+
+      function clearError() {
+        errorEl.style.display = 'none';
+        errorEl.textContent = '';
+      }
+
+      function updateVibe(tags) {
+        /*
+         * Professional vibe mapping: each genre maps to a
+         * background gradient (--bg) and a glow colour (--glow)
+         * that pulses behind the page via the body::before animation.
+         */
+        const vibes = {
+          electronic:  { bg: 'linear-gradient(135deg, #0f0024 0%, #3a007d 40%, #7b2ff7 100%)', glow: 'radial-gradient(circle, rgba(123,47,247,0.6), transparent 70%)' },
+          chill:       { bg: 'linear-gradient(135deg, #0b1e3d 0%, #1b4f72 40%, #5dade2 100%)', glow: 'radial-gradient(circle, rgba(93,173,226,0.5), transparent 70%)' },
+          acoustic:    { bg: 'linear-gradient(135deg, #0a1f0a 0%, #1b5e20 40%, #4caf50 100%)', glow: 'radial-gradient(circle, rgba(76,175,80,0.45), transparent 70%)' },
+          rock:        { bg: 'linear-gradient(135deg, #1a0000 0%, #6d0000 40%, #d32f2f 100%)', glow: 'radial-gradient(circle, rgba(211,47,47,0.5), transparent 70%)' },
+          pop:         { bg: 'linear-gradient(135deg, #1a0033 0%, #8e24aa 40%, #f06292 100%)', glow: 'radial-gradient(circle, rgba(240,98,146,0.5), transparent 70%)' },
+          jazz:        { bg: 'linear-gradient(135deg, #1a1000 0%, #4e342e 40%, #d4a056 100%)', glow: 'radial-gradient(circle, rgba(212,160,86,0.45), transparent 70%)' },
+          hiphop:      { bg: 'linear-gradient(135deg, #0d0d0d 0%, #37474f 40%, #ff6f00 100%)', glow: 'radial-gradient(circle, rgba(255,111,0,0.45), transparent 70%)' },
+          'hip-hop':   { bg: 'linear-gradient(135deg, #0d0d0d 0%, #37474f 40%, #ff6f00 100%)', glow: 'radial-gradient(circle, rgba(255,111,0,0.45), transparent 70%)' },
+          rnb:         { bg: 'linear-gradient(135deg, #120024 0%, #4a148c 40%, #ce93d8 100%)', glow: 'radial-gradient(circle, rgba(206,147,216,0.45), transparent 70%)' },
+          'r&b':       { bg: 'linear-gradient(135deg, #120024 0%, #4a148c 40%, #ce93d8 100%)', glow: 'radial-gradient(circle, rgba(206,147,216,0.45), transparent 70%)' },
+          classical:   { bg: 'linear-gradient(135deg, #0d0d1a 0%, #1a237e 40%, #9fa8da 100%)', glow: 'radial-gradient(circle, rgba(159,168,218,0.4), transparent 70%)' },
+          metal:       { bg: 'linear-gradient(135deg, #0a0a0a 0%, #212121 40%, #616161 100%)', glow: 'radial-gradient(circle, rgba(97,97,97,0.5), transparent 70%)' },
+          country:     { bg: 'linear-gradient(135deg, #1b1200 0%, #795548 40%, #ffcc80 100%)', glow: 'radial-gradient(circle, rgba(255,204,128,0.45), transparent 70%)' },
+          soul:        { bg: 'linear-gradient(135deg, #1a0a00 0%, #bf360c 40%, #ffab91 100%)', glow: 'radial-gradient(circle, rgba(255,171,145,0.45), transparent 70%)' },
+          funk:        { bg: 'linear-gradient(135deg, #1a0033 0%, #6a1b9a 40%, #ffd600 100%)', glow: 'radial-gradient(circle, rgba(255,214,0,0.45), transparent 70%)' },
+          reggae:      { bg: 'linear-gradient(135deg, #0a1f0a 0%, #1b5e20 40%, #fdd835 100%)', glow: 'radial-gradient(circle, rgba(253,216,53,0.4), transparent 70%)' },
+          blues:       { bg: 'linear-gradient(135deg, #0d1b2a 0%, #1565c0 40%, #90caf9 100%)', glow: 'radial-gradient(circle, rgba(144,202,249,0.45), transparent 70%)' },
+          indie:       { bg: 'linear-gradient(135deg, #1a1a2e 0%, #16213e 40%, #e94560 100%)', glow: 'radial-gradient(circle, rgba(233,69,96,0.45), transparent 70%)' },
+          ambient:     { bg: 'linear-gradient(135deg, #000a12 0%, #01579b 40%, #4fc3f7 100%)', glow: 'radial-gradient(circle, rgba(79,195,247,0.35), transparent 70%)' },
+          dance:       { bg: 'linear-gradient(135deg, #0f0024 0%, #aa00ff 40%, #ea80fc 100%)', glow: 'radial-gradient(circle, rgba(234,128,252,0.5), transparent 70%)' },
+          latin:       { bg: 'linear-gradient(135deg, #1a0000 0%, #c62828 40%, #ffab00 100%)', glow: 'radial-gradient(circle, rgba(255,171,0,0.5), transparent 70%)' },
+          punk:        { bg: 'linear-gradient(135deg, #0a0a0a 0%, #212121 40%, #76ff03 100%)', glow: 'radial-gradient(circle, rgba(118,255,3,0.4), transparent 70%)' },
+        };
+
+        const normalized = (Array.isArray(tags) ? tags : [])
+          .map(t => String(t || '').trim().toLowerCase())
+          .filter(Boolean);
+
+        let chosen = null;
+        for (const t of normalized) {
+          if (vibes[t]) { chosen = { tag: t, ...vibes[t] }; break; }
+        }
+
+        if (!chosen) {
+          document.documentElement.style.setProperty('--bg', '#101018');
+          document.documentElement.style.setProperty('--glow', 'transparent');
+          tagsPill.style.display = 'none';
+          tagsPill.textContent = '';
+          return;
+        }
+
+        document.documentElement.style.setProperty('--bg', chosen.bg);
+        document.documentElement.style.setProperty('--glow', chosen.glow);
+        tagsPill.style.display = 'inline-block';
+        tagsPill.textContent = `Top tags: ${normalized.slice(0, 3).join(', ')}`;
+      }
+
+      async function record10Seconds() {
+        clearError();
+        setStatus('Requesting mic…');
+
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const chunks = [];
+
+        // Pick a safe mimeType if available.
+        const preferred = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus'];
+        const chosenMime = preferred.find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t));
+
+        const recorder = chosenMime ? new MediaRecorder(stream, { mimeType: chosenMime }) : new MediaRecorder(stream);
+
+        recorder.ondataavailable = (e) => {
+          if (e.data && e.data.size > 0) chunks.push(e.data);
+        };
+
+        const stopped = new Promise((resolve) => {
+          recorder.onstop = resolve;
+        });
+
+        recorder.start();
+        setStatus('Recording…');
+
+        await new Promise((r) => setTimeout(r, 10_000));
+        recorder.stop();
+
+        await stopped;
+        stream.getTracks().forEach(t => t.stop());
+
+        const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
+        return blob;
+      }
+
+      async function identify(blob) {
+        setStatus('Uploading…');
+
+        const fd = new FormData();
+        const ext = (blob.type && blob.type.includes('ogg')) ? 'ogg' : 'webm';
+        fd.append('audio', blob, `recording.${ext}`);
+
+        const resp = await fetch('/identify', { method: 'POST', body: fd });
+        const payload = await resp.json().catch(() => ({}));
+
+        if (!resp.ok) {
+          const msg = payload && (payload.error || payload.message) ? JSON.stringify(payload, null, 2) : `Request failed (${resp.status})`;
+          throw new Error(msg);
+        }
+
+        return payload;
+      }
+
+      function renderResult(payload) {
+        const identified = payload && payload.identified ? payload.identified : null;
+        if (!identified) {
+          identifiedEl.textContent = '—';
+        } else {
+          const artist = identified.artist || 'Unknown artist';
+          const title = identified.title || 'Unknown title';
+          identifiedEl.textContent = `${artist} — ${title}`;
+        }
+
+        recsEl.innerHTML = '';
+        const similar = payload && payload.lastfm && Array.isArray(payload.lastfm.similar_tracks) ? payload.lastfm.similar_tracks : [];
+        for (const t of similar) {
+          const li = document.createElement('li');
+          const name = t.name || 'Unknown track';
+          const artist = t.artist || 'Unknown artist';
+
+          // Track name (linked to Last.fm if available)
+          const span = document.createElement('span');
+          if (t.url) {
+            const a = document.createElement('a');
+            a.href = t.url;
+            a.target = '_blank';
+            a.rel = 'noreferrer';
+            a.textContent = `${artist} — ${name}`;
+            span.appendChild(a);
+          } else {
+            span.textContent = `${artist} — ${name}`;
+          }
+          li.appendChild(span);
+
+          // YouTube search link
+          const ytQuery = encodeURIComponent(`${artist} - ${name}`);
+          const ytLink = document.createElement('a');
+          ytLink.href = `https://www.youtube.com/results?search_query=${ytQuery}`;
+          ytLink.target = '_blank';
+          ytLink.rel = 'noreferrer';
+          ytLink.className = 'yt-link';
+          ytLink.textContent = '▶ YouTube';
+          li.appendChild(ytLink);
+
+          recsEl.appendChild(li);
+        }
+
+        const tags = payload && payload.lastfm && Array.isArray(payload.lastfm.top_tags) ? payload.lastfm.top_tags : [];
+        updateVibe(tags);
+      }
+
+      recordBtn.addEventListener('click', async () => {
+        recordBtn.disabled = true;
+        setStatus('Starting…');
+        identifiedEl.textContent = '—';
+        recsEl.innerHTML = '';
+        tagsPill.style.display = 'none';
+
+        try {
+          const blob = await record10Seconds();
+          setStatus('Identifying…');
+          const payload = await identify(blob);
+          renderResult(payload);
+          setStatus('Done');
+        } catch (e) {
+          setStatus('Error');
+          showError(e && e.message ? e.message : String(e));
+        } finally {
+          recordBtn.disabled = false;
+        }
+      });
+    </script>
+  </body>
+</html>
