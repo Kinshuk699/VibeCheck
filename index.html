@@ -789,6 +789,8 @@
           const w = r.width, h = r.height;
           cCtx.clearRect(0, 0, w, h);
 
+          const now = performance.now();
+
           // edges
           for (const e of edges) {
             const a = nodeById(e.source), b = nodeById(e.target);
@@ -821,10 +823,21 @@
             // disc
             cCtx.beginPath();
             cCtx.fillStyle = n.color;
+
+            // Twinkling star shadow glow
+            // Base blur follows node size; pulse is a subtle sine wave.
+            const pulse = 0.85 + 0.25 * Math.sin(now * 0.004 + n.id * 1.7);
+            cCtx.shadowColor = n.color;
+            cCtx.shadowBlur = (n.radius * 2) * pulse;
+
             cCtx.globalAlpha = n === hoveredNode ? 1 : 0.9;
             cCtx.arc(s.x, s.y, sr, 0, Math.PI * 2);
             cCtx.fill();
             cCtx.globalAlpha = 1;
+
+            // Reset shadow so it doesn't affect text/lines
+            cCtx.shadowBlur = 0;
+            cCtx.shadowColor = 'transparent';
 
             // loading spinner ring for expanding node
             if (n.id === loadingNodeId) {
@@ -885,11 +898,17 @@
         }
 
         /* ── node creation ─────────────────────────────── */
+        function buildYouTubeUrl(artist, title) {
+          const q = encodeURIComponent(`${artist || ''} - ${title || ''}`.trim());
+          return `https://www.youtube.com/results?search_query=${q}`;
+        }
+
         function addNode({ artist, title, tags, playcount, x, y, parent, isSeed }) {
           const nid = makeId();
           nodes.push({
             id: nid,
             artist, title, tags,
+            youtubeUrl: buildYouTubeUrl(artist, title),
             playcount: playcount || 0,
             x: x || 0, y: y || 0,
             vx: (Math.random() - 0.5) * 2,
@@ -1040,13 +1059,15 @@
             }
           }
           if (hoveredNode) {
-            wrap.style.cursor = hoveredNode.expanded ? 'default' : 'pointer';
+            wrap.style.cursor = 'pointer';
+            cvs.title = 'Click to expand, Alt-Click to listen';
             ttip.style.display = 'block';
             ttip.textContent = `${hoveredNode.artist} — ${hoveredNode.title}${hoveredNode.playcount ? '  (' + hoveredNode.playcount.toLocaleString() + ' plays)' : ''}`;
             ttip.style.left = (mx + 14) + 'px';
             ttip.style.top  = (my - 8) + 'px';
           } else {
             wrap.style.cursor = dragging ? 'grabbing' : 'grab';
+            cvs.title = '';
             ttip.style.display = 'none';
           }
         });
@@ -1057,8 +1078,13 @@
           dragging = false;
 
           // treat as click if barely moved
-          if (dx < 4 && dy < 4 && hoveredNode && !hoveredNode.expanded) {
-            expandNode(hoveredNode);
+          if (dx < 4 && dy < 4 && hoveredNode) {
+            if (e.altKey || hoveredNode.expanded) {
+              const url = hoveredNode.youtubeUrl || buildYouTubeUrl(hoveredNode.artist, hoveredNode.title);
+              window.open(url, '_blank');
+            } else {
+              expandNode(hoveredNode);
+            }
           }
         });
 
