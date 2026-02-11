@@ -185,6 +185,80 @@
         font-size: 13px;
         margin-top: 8px;
       }
+
+      /* ── Constellation ─────────────────────────────── */
+      #constellationSection {
+        display: none;                /* shown after first identify */
+        margin-top: 24px;
+      }
+      #constellationSection.active { display: block; }
+
+      .constellation-header {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        flex-wrap: wrap;
+        margin-bottom: 10px;
+      }
+
+      .constellation-header h2 {
+        margin: 0;
+        font-size: 20px;
+        letter-spacing: 0.3px;
+      }
+
+      .slider-group {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 13px;
+        color: var(--muted);
+      }
+
+      .slider-group input[type="range"] {
+        width: 110px;
+        accent-color: var(--vibe-color, #8aa7ff);
+      }
+
+      #constellationWrap {
+        position: relative;
+        width: 100%;
+        height: 520px;
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        overflow: hidden;
+        background: rgba(0,0,0,0.35);
+        cursor: grab;
+      }
+      #constellationWrap:active { cursor: grabbing; }
+      #constellationWrap.loading { cursor: wait; }
+
+      #constellationCanvas {
+        width: 100%;
+        height: 100%;
+        display: block;
+      }
+
+      #constellationTooltip {
+        position: absolute;
+        pointer-events: none;
+        background: rgba(20,20,30,0.92);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 6px 10px;
+        font-size: 13px;
+        color: var(--text);
+        white-space: nowrap;
+        display: none;
+        z-index: 10;
+      }
+
+      .constellation-legend {
+        margin-top: 8px;
+        font-size: 12px;
+        color: var(--muted);
+        line-height: 1.5;
+      }
     </style>
   </head>
   <body>
@@ -213,6 +287,25 @@
       </div>
 
       <div id="error" class="err"></div>
+
+      <!-- ── Constellation ─────────────────────────────── -->
+      <div id="constellationSection">
+        <div class="constellation-header">
+          <h2>Music Constellation</h2>
+          <div class="slider-group">
+            <label for="gravitySlider">Gravity</label>
+            <input id="gravitySlider" type="range" min="5" max="300" value="80" />
+          </div>
+          <button id="resetConstBtn" style="font-size:13px;padding:6px 10px;">Reset Map</button>
+        </div>
+        <div id="constellationWrap">
+          <canvas id="constellationCanvas"></canvas>
+          <div id="constellationTooltip"></div>
+        </div>
+        <p class="constellation-legend">
+          Click a star to expand&nbsp;·&nbsp;Bigger star = more plays&nbsp;·&nbsp;Shorter line = more similar&nbsp;·&nbsp;Drag to pan&nbsp;·&nbsp;Scroll to zoom
+        </p>
+      </div>
     </div>
 
     <script>
@@ -531,6 +624,14 @@
           const payload = await identify(blob);
           renderResult(payload);
           setStatus('Done');
+
+          // ── Seed the constellation with the identified track ──
+          if (payload && payload.identified) {
+            const seed = payload.identified;
+            const tags = (payload.lastfm && payload.lastfm.top_tags) || [];
+            const recs = (payload.lastfm && payload.lastfm.similar_tracks) || [];
+            constellation.init(seed, tags, recs);
+          }
         } catch (e) {
           setStatus('Error');
           showError(e && e.message ? e.message : String(e));
@@ -538,6 +639,519 @@
           recordBtn.disabled = false;
         }
       });
+
+      /* ================================================================
+       *  MUSIC CONSTELLATION – Force-Directed Graph on Canvas
+       * ================================================================ */
+      const constellation = (() => {
+        const section  = document.getElementById('constellationSection');
+        const wrap     = document.getElementById('constellationWrap');
+        const cvs      = document.getElementById('constellationCanvas');
+        const ttip     = document.getElementById('constellationTooltip');
+        const gravSlider = document.getElementById('gravitySlider');
+        const resetBtn   = document.getElementById('resetConstBtn');
+        const cCtx     = cvs.getContext('2d');
+
+        /* ── state ─────────────────────────────────────── */
+        let nodes  = [];   // { id, artist, title, tags, playcount, x, y, vx, vy, radius, color, expanded, parent }
+        let edges  = [];   // { source (id), target (id), similarity }
+        let idCounter = 0;
+
+        /* camera */
+        let camX = 0, camY = 0, camScale = 1;
+
+        /* interaction */
+        let dragging  = false;
+        let dragStart = { x: 0, y: 0 };
+        let camStart  = { x: 0, y: 0 };
+        let hoveredNode = null;
+        let animId    = null;
+        let loadingNodeId = null;   // node being expanded
+
+        /* ── vibe colors (reuse the same palette) ──────── */
+        const vibeColors = {
+          electronic: '#a884ff', chill: '#7dc8ff', acoustic: '#6fd07b',
+          rock: '#ff5a5a', pop: '#ff8db6', jazz: '#f2c17b',
+          hiphop: '#ff8f3a', 'hip-hop': '#ff8f3a', rnb: '#e0a7f2',
+          'r&b': '#e0a7f2', classical: '#b8c1ff', metal: '#b0b0b0',
+          country: '#ffd59b', soul: '#ffb9a3', funk: '#ffe263',
+          reggae: '#ffe36f', blues: '#a8d4ff', indie: '#ff7b92',
+          ambient: '#8bdcff', dance: '#f2a2ff', latin: '#ffc04d',
+          punk: '#b7ff5c',
+        };
+
+        function colorForTags(tags) {
+          for (const t of (tags || [])) {
+            const k = String(t).trim().toLowerCase();
+            if (vibeColors[k]) return vibeColors[k];
+          }
+          return '#8aa7ff';
+        }
+
+        /* ── helpers ───────────────────────────────────── */
+        function nodeById(id) { return nodes.find(n => n.id === id); }
+
+        function radiusFromPlaycount(pc) {
+          if (!pc || pc <= 0) return 8;
+          // log-scale: 0 → 8,  1M → ~18,  100M → ~28
+          return Math.min(32, 8 + Math.log10(pc + 1) * 2.8);
+        }
+
+        function lineLengthFromSimilarity(sim) {
+          // sim ∈ [0,1]: 1→short (60), 0→long (220)
+          const s = parseFloat(sim) || 0.5;
+          return 220 - s * 160;
+        }
+
+        function makeId() { return ++idCounter; }
+
+        /* ── canvas sizing ─────────────────────────────── */
+        function resizeConst() {
+          const r = wrap.getBoundingClientRect();
+          const dpr = Math.max(1, window.devicePixelRatio || 1);
+          cvs.width  = Math.floor(r.width * dpr);
+          cvs.height = Math.floor(r.height * dpr);
+          cvs.style.width  = r.width + 'px';
+          cvs.style.height = r.height + 'px';
+          cCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        }
+
+        /* ── world ↔ screen ────────────────────────────── */
+        function worldToScreen(wx, wy) {
+          const r = wrap.getBoundingClientRect();
+          return {
+            x: (wx - camX) * camScale + r.width / 2,
+            y: (wy - camY) * camScale + r.height / 2,
+          };
+        }
+        function screenToWorld(sx, sy) {
+          const r = wrap.getBoundingClientRect();
+          return {
+            x: (sx - r.width / 2)  / camScale + camX,
+            y: (sy - r.height / 2) / camScale + camY,
+          };
+        }
+
+        /* ── force simulation (simple Euler integration) ── */
+        function simulate() {
+          const gravity   = parseFloat(gravSlider.value) || 80;
+          const repulsion = 6000;
+          const damping   = 0.88;
+          const dt        = 0.18;
+
+          // repulsion between all nodes
+          for (let i = 0; i < nodes.length; i++) {
+            for (let j = i + 1; j < nodes.length; j++) {
+              const a = nodes[i], b = nodes[j];
+              let dx = b.x - a.x, dy = b.y - a.y;
+              let dist = Math.sqrt(dx * dx + dy * dy) || 1;
+              const force = repulsion / (dist * dist);
+              const fx = (dx / dist) * force;
+              const fy = (dy / dist) * force;
+              a.vx -= fx * dt; a.vy -= fy * dt;
+              b.vx += fx * dt; b.vy += fy * dt;
+            }
+          }
+
+          // attraction along edges (spring)
+          for (const e of edges) {
+            const a = nodeById(e.source), b = nodeById(e.target);
+            if (!a || !b) continue;
+            let dx = b.x - a.x, dy = b.y - a.y;
+            let dist = Math.sqrt(dx * dx + dy * dy) || 1;
+            const rest = lineLengthFromSimilarity(e.similarity);
+            const stiffness = gravity / 100;          // slider controls spring stiffness
+            const displacement = dist - rest;
+            const fx = (dx / dist) * displacement * stiffness * dt;
+            const fy = (dy / dist) * displacement * stiffness * dt;
+            a.vx += fx; a.vy += fy;
+            b.vx -= fx; b.vy -= fy;
+          }
+
+          // center gravity (very mild pull toward origin)
+          for (const n of nodes) {
+            n.vx -= n.x * 0.002 * dt;
+            n.vy -= n.y * 0.002 * dt;
+          }
+
+          // integrate
+          for (const n of nodes) {
+            n.vx *= damping;
+            n.vy *= damping;
+            n.x += n.vx;
+            n.y += n.vy;
+          }
+        }
+
+        /* ── draw ──────────────────────────────────────── */
+        function draw() {
+          const r = wrap.getBoundingClientRect();
+          const w = r.width, h = r.height;
+          cCtx.clearRect(0, 0, w, h);
+
+          // edges
+          for (const e of edges) {
+            const a = nodeById(e.source), b = nodeById(e.target);
+            if (!a || !b) continue;
+            const sa = worldToScreen(a.x, a.y);
+            const sb = worldToScreen(b.x, b.y);
+            cCtx.beginPath();
+            cCtx.strokeStyle = 'rgba(255,255,255,0.12)';
+            cCtx.lineWidth = 1;
+            cCtx.moveTo(sa.x, sa.y);
+            cCtx.lineTo(sb.x, sb.y);
+            cCtx.stroke();
+          }
+
+          // nodes
+          for (const n of nodes) {
+            const s = worldToScreen(n.x, n.y);
+            const sr = n.radius * camScale;
+            if (s.x + sr < 0 || s.x - sr > w || s.y + sr < 0 || s.y - sr > h) continue; // off-screen
+
+            // glow
+            const grad = cCtx.createRadialGradient(s.x, s.y, sr * 0.4, s.x, s.y, sr * 2.2);
+            grad.addColorStop(0, n.color + '66');
+            grad.addColorStop(1, 'transparent');
+            cCtx.fillStyle = grad;
+            cCtx.beginPath();
+            cCtx.arc(s.x, s.y, sr * 2.2, 0, Math.PI * 2);
+            cCtx.fill();
+
+            // disc
+            cCtx.beginPath();
+            cCtx.fillStyle = n.color;
+            cCtx.globalAlpha = n === hoveredNode ? 1 : 0.9;
+            cCtx.arc(s.x, s.y, sr, 0, Math.PI * 2);
+            cCtx.fill();
+            cCtx.globalAlpha = 1;
+
+            // loading spinner ring for expanding node
+            if (n.id === loadingNodeId) {
+              cCtx.beginPath();
+              const angle = (performance.now() / 400) % (Math.PI * 2);
+              cCtx.arc(s.x, s.y, sr + 4, angle, angle + Math.PI * 1.2);
+              cCtx.strokeStyle = '#fff';
+              cCtx.lineWidth = 2;
+              cCtx.stroke();
+            }
+
+            // label (only when zoomed in enough)
+            if (camScale > 0.45 && sr > 5) {
+              cCtx.fillStyle = 'rgba(255,255,255,0.8)';
+              cCtx.font = `${Math.max(9, Math.round(11 * camScale))}px ui-sans-serif, system-ui, sans-serif`;
+              cCtx.textAlign = 'center';
+              cCtx.fillText(n.title, s.x, s.y + sr + 13);
+            }
+          }
+        }
+
+        /* ── animation loop ────────────────────────────── */
+        function tick() {
+          simulate();
+          draw();
+          animId = requestAnimationFrame(tick);
+        }
+        function startLoop() {
+          if (!animId) animId = requestAnimationFrame(tick);
+        }
+        function stopLoop() {
+          if (animId) { cancelAnimationFrame(animId); animId = null; }
+        }
+
+        /* ── camera helpers ────────────────────────────── */
+        function panToNode(n, smooth) {
+          camX = n.x;
+          camY = n.y;
+        }
+
+        function fitAll() {
+          if (!nodes.length) return;
+          let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+          for (const n of nodes) {
+            minX = Math.min(minX, n.x - n.radius);
+            maxX = Math.max(maxX, n.x + n.radius);
+            minY = Math.min(minY, n.y - n.radius);
+            maxY = Math.max(maxY, n.y + n.radius);
+          }
+          const r = wrap.getBoundingClientRect();
+          const margin = 60;
+          const scaleX = (r.width  - margin * 2) / (maxX - minX || 1);
+          const scaleY = (r.height - margin * 2) / (maxY - minY || 1);
+          camScale = Math.min(scaleX, scaleY, 2.5);
+          camScale = Math.max(camScale, 0.15);
+          camX = (minX + maxX) / 2;
+          camY = (minY + maxY) / 2;
+        }
+
+        /* ── node creation ─────────────────────────────── */
+        function addNode({ artist, title, tags, playcount, x, y, parent, isSeed }) {
+          const nid = makeId();
+          nodes.push({
+            id: nid,
+            artist, title, tags,
+            playcount: playcount || 0,
+            x: x || 0, y: y || 0,
+            vx: (Math.random() - 0.5) * 2,
+            vy: (Math.random() - 0.5) * 2,
+            radius: radiusFromPlaycount(playcount),
+            color: colorForTags(tags),
+            expanded: false,
+            parent: parent || null,
+            isSeed: !!isSeed,
+          });
+          return nid;
+        }
+
+        function addEdge(sourceId, targetId, similarity) {
+          edges.push({ source: sourceId, target: targetId, similarity: similarity || 0.5 });
+        }
+
+        /* ── helpers for deduplication ─────────────────── */
+        function nodeKey(artist, title) {
+          return (artist || '').trim().toLowerCase() + '\0' + (title || '').trim().toLowerCase();
+        }
+
+        function findExistingNode(artist, title) {
+          const key = nodeKey(artist, title);
+          return nodes.find(n => nodeKey(n.artist, n.title) === key) || null;
+        }
+
+        function edgeExists(srcId, tgtId) {
+          return edges.some(e =>
+            (e.source === srcId && e.target === tgtId) ||
+            (e.source === tgtId && e.target === srcId)
+          );
+        }
+
+        function buildExcludeList() {
+          return nodes.map(n => ({ artist: n.artist, title: n.title }));
+        }
+
+        /* ── expand a node (click-to-expand) ───────────── */
+        async function expandNode(node) {
+          if (node.expanded || loadingNodeId) return;
+          node.expanded = true;
+          loadingNodeId = node.id;
+          wrap.classList.add('loading');
+
+          try {
+            const resp = await fetch('/recommend', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                artist: node.artist,
+                title: node.title,
+                exclude: buildExcludeList(),
+              }),
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) return;
+
+            const recs = (data.lastfm && data.lastfm.similar_tracks) || [];
+            const newChildren = [];       // track which nodes are newly created
+            const angle0 = Math.random() * Math.PI * 2;
+            recs.forEach((t, i) => {
+              const a = angle0 + (i / recs.length) * Math.PI * 2;
+              const dist = lineLengthFromSimilarity(t.match);
+              const recArtist = t.artist || 'Unknown';
+              const recTitle  = t.name   || 'Unknown';
+
+              // Check if this track already exists in the graph
+              const existing = findExistingNode(recArtist, recTitle);
+              if (existing) {
+                // Just draw an edge to the existing node (no duplicate)
+                if (!edgeExists(node.id, existing.id)) {
+                  addEdge(node.id, existing.id, t.match);
+                }
+                return;
+              }
+
+              const nid = addNode({
+                artist: recArtist,
+                title: recTitle,
+                tags: (data.lastfm && data.lastfm.top_tags) || [],
+                playcount: 0,
+                x: node.x + Math.cos(a) * dist * 0.6,
+                y: node.y + Math.sin(a) * dist * 0.6,
+                parent: node.id,
+              });
+              addEdge(node.id, nid, t.match);
+              newChildren.push({ node: nodeById(nid), track: t });
+            });
+
+            // fetch playcounts in background only for NEW nodes
+            newChildren.forEach(({ node: child, track: t }) => {
+              if (!child) return;
+              fetch('/recommend', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ artist: t.artist, title: t.name }),
+              }).then(r => r.json()).then(d => {
+                if (d && d.seed && d.seed.playcount) {
+                  child.playcount = d.seed.playcount;
+                  child.radius = radiusFromPlaycount(d.seed.playcount);
+                }
+                if (d && d.lastfm && d.lastfm.top_tags && d.lastfm.top_tags.length) {
+                  child.tags = d.lastfm.top_tags;
+                  child.color = colorForTags(child.tags);
+                }
+              }).catch(() => {});
+            });
+
+            // gentle auto-fit after expansion
+            setTimeout(fitAll, 600);
+          } finally {
+            loadingNodeId = null;
+            wrap.classList.remove('loading');
+          }
+        }
+
+        /* ── interaction: drag-to-pan ──────────────────── */
+        wrap.addEventListener('pointerdown', (e) => {
+          if (e.button !== 0) return;
+          dragging = true;
+          dragStart = { x: e.clientX, y: e.clientY };
+          camStart  = { x: camX, y: camY };
+          wrap.setPointerCapture(e.pointerId);
+        });
+        wrap.addEventListener('pointermove', (e) => {
+          const rect = wrap.getBoundingClientRect();
+          const mx = e.clientX - rect.left;
+          const my = e.clientY - rect.top;
+
+          if (dragging) {
+            const dx = e.clientX - dragStart.x;
+            const dy = e.clientY - dragStart.y;
+            camX = camStart.x - dx / camScale;
+            camY = camStart.y - dy / camScale;
+            return;
+          }
+
+          // hover detection
+          const wp = screenToWorld(mx, my);
+          hoveredNode = null;
+          for (let i = nodes.length - 1; i >= 0; i--) {
+            const n = nodes[i];
+            const dx = wp.x - n.x, dy = wp.y - n.y;
+            if (dx * dx + dy * dy < (n.radius + 4) * (n.radius + 4)) {
+              hoveredNode = n;
+              break;
+            }
+          }
+          if (hoveredNode) {
+            wrap.style.cursor = hoveredNode.expanded ? 'default' : 'pointer';
+            ttip.style.display = 'block';
+            ttip.textContent = `${hoveredNode.artist} — ${hoveredNode.title}${hoveredNode.playcount ? '  (' + hoveredNode.playcount.toLocaleString() + ' plays)' : ''}`;
+            ttip.style.left = (mx + 14) + 'px';
+            ttip.style.top  = (my - 8) + 'px';
+          } else {
+            wrap.style.cursor = dragging ? 'grabbing' : 'grab';
+            ttip.style.display = 'none';
+          }
+        });
+        wrap.addEventListener('pointerup', (e) => {
+          if (!dragging) return;
+          const dx = Math.abs(e.clientX - dragStart.x);
+          const dy = Math.abs(e.clientY - dragStart.y);
+          dragging = false;
+
+          // treat as click if barely moved
+          if (dx < 4 && dy < 4 && hoveredNode && !hoveredNode.expanded) {
+            expandNode(hoveredNode);
+          }
+        });
+
+        /* ── zoom ──────────────────────────────────────── */
+        wrap.addEventListener('wheel', (e) => {
+          e.preventDefault();
+          const factor = e.deltaY < 0 ? 1.12 : 0.89;
+          camScale = Math.max(0.08, Math.min(5, camScale * factor));
+        }, { passive: false });
+
+        /* ── gravity slider live update (no extra work, the sim reads it) ── */
+
+        /* ── reset ─────────────────────────────────────── */
+        resetBtn.addEventListener('click', () => {
+          nodes = [];
+          edges = [];
+          idCounter = 0;
+          camX = 0; camY = 0; camScale = 1;
+          hoveredNode = null;
+          loadingNodeId = null;
+          section.classList.remove('active');
+          stopLoop();
+        });
+
+        /* ── resize ────────────────────────────────────── */
+        window.addEventListener('resize', () => { if (section.classList.contains('active')) resizeConst(); });
+
+        /* ── public API ────────────────────────────────── */
+        return {
+          /** Called after /identify to seed the constellation. */
+          init(identified, tags, recs) {
+            // Reset
+            nodes = []; edges = []; idCounter = 0;
+            camX = 0; camY = 0; camScale = 1;
+            hoveredNode = null;
+
+            section.classList.add('active');
+            resizeConst();
+
+            // Hub node
+            const hubId = addNode({
+              artist: identified.artist || 'Unknown',
+              title: identified.title || 'Unknown',
+              tags: tags,
+              playcount: identified.playcount || 0,
+              x: 0, y: 0,
+              isSeed: true,
+            });
+            const hub = nodeById(hubId);
+            hub.expanded = true;     // it already has children
+
+            // Child nodes
+            const angle0 = Math.random() * Math.PI * 2;
+            recs.forEach((t, i) => {
+              const a = angle0 + (i / recs.length) * Math.PI * 2;
+              const dist = lineLengthFromSimilarity(t.match);
+              const nid = addNode({
+                artist: t.artist || 'Unknown',
+                title: t.name || 'Unknown',
+                tags: tags,            // inherit parent tags initially
+                playcount: 0,
+                x: Math.cos(a) * dist * 0.6,
+                y: Math.sin(a) * dist * 0.6,
+                parent: hubId,
+              });
+              addEdge(hubId, nid, t.match);
+            });
+
+            // Fetch individual playcounts + tags in background
+            recs.forEach((t, i) => {
+              const child = nodes[1 + i];
+              if (!child) return;
+              fetch('/recommend', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ artist: t.artist, title: t.name }),
+              }).then(r => r.json()).then(d => {
+                if (d && d.seed && d.seed.playcount) {
+                  child.playcount = d.seed.playcount;
+                  child.radius = radiusFromPlaycount(d.seed.playcount);
+                }
+                if (d && d.lastfm && d.lastfm.top_tags && d.lastfm.top_tags.length) {
+                  child.tags = d.lastfm.top_tags;
+                  child.color = colorForTags(child.tags);
+                }
+              }).catch(() => {});
+            });
+
+            startLoop();
+            fitAll();
+          },
+        };
+      })();
     </script>
   </body>
 </html>

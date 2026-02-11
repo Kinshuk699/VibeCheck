@@ -416,5 +416,132 @@ def identify():
     return jsonify(result)
 
 
+@app.post("/recommend")
+def recommend():
+    """Return similar tracks + tags for a given artist/title (no audio needed).
+
+    Expects JSON body: {"artist": "...", "title": "..."}
+    Returns the same lastfm block as /identify so the frontend can reuse logic.
+    """
+    body = request.get_json(silent=True) or {}
+    artist = (body.get("artist") or "").strip()
+    title = (body.get("title") or "").strip()
+
+    if not artist or not title:
+        return jsonify({"error": "missing_artist_or_title",
+                        "hint": "POST JSON with 'artist' and 'title'"}), 400
+
+    # --- Build an exclusion set from tracks the frontend already has ---
+    raw_exclude = body.get("exclude") or []  # [{"artist":"...","title":"..."}]
+    exclude_keys: set[tuple[str, str]] = set()
+    for ex in raw_exclude:
+        a = str(ex.get("artist") or "").strip().lower()
+        t = str(ex.get("title") or "").strip().lower()
+        if a or t:
+            exclude_keys.add((a, t))
+    # Also exclude the seed itself
+    exclude_keys.add((artist.strip().lower(), title.strip().lower()))
+
+    lastfm_api_key = os.getenv("LASTFM_API_KEY", "YOUR_LASTFM_API_KEY")
+    lastfm_artist = _normalize_lastfm_artist(artist)
+    lastfm_track = title
+
+    # --- Top tags ---
+    try:
+        top_tags = _lastfm_get_top_tags(artist=lastfm_artist, track=lastfm_track,
+                                        api_key=lastfm_api_key, limit=3)
+    except requests.RequestException:
+        top_tags = []
+
+    # --- Playcount (used for star size in the constellation) ---
+    playcount = None
+    try:
+        info_resp = requests.get("https://ws.audioscrobbler.com/2.0/", params={
+            "method": "track.getInfo",
+            "artist": lastfm_artist,
+            "track": lastfm_track,
+            "api_key": lastfm_api_key,
+            "format": "json",
+            "autocorrect": "1",
+        }, timeout=15)
+        info_resp.raise_for_status()
+        info_payload = info_resp.json()
+        playcount = int(info_payload.get("track", {}).get("playcount", 0))
+    except Exception:
+        pass
+
+    # --- Similar tracks (merged strategy, over-fetch then filter) ---
+    desired = 5
+    fetch_limit = desired + len(exclude_keys) + 10  # over-fetch to compensate for exclusions
+    similar_tracks: list[dict[str, Any]] = []
+    similar_sources: list[str] = []
+
+    try:
+        from_track = _lastfm_get_similar(artist=lastfm_artist, track=lastfm_track,
+                                         api_key=lastfm_api_key, limit=fetch_limit)
+    except requests.RequestException:
+        from_track = []
+    if from_track:
+        similar_sources.append("track.getSimilar")
+        similar_tracks = _merge_unique_tracks(similar_tracks, from_track, limit=fetch_limit)
+
+    if len(similar_tracks) < fetch_limit:
+        try:
+            from_artist = _lastfm_get_similar_via_artist(artist=lastfm_artist,
+                                                         api_key=lastfm_api_key, limit=fetch_limit)
+        except requests.RequestException:
+            from_artist = []
+        if from_artist:
+            similar_sources.append("artist.getSimilar")
+            similar_tracks = _merge_unique_tracks(similar_tracks, from_artist, limit=fetch_limit)
+
+    if len(similar_tracks) < fetch_limit and top_tags:
+        tag_collected: list[dict[str, Any]] = []
+        for tag in top_tags:
+            if len(tag_collected) >= fetch_limit:
+                break
+            try:
+                from_tag = _lastfm_get_similar_via_tags(tags=[tag], api_key=lastfm_api_key, limit=fetch_limit)
+            except requests.RequestException:
+                continue
+            tag_collected = _merge_unique_tracks(tag_collected, from_tag, limit=fetch_limit)
+        if tag_collected:
+            similar_sources.append("tag.getTopTracks")
+            similar_tracks = _merge_unique_tracks(similar_tracks, tag_collected, limit=fetch_limit)
+
+    if len(similar_tracks) < desired:
+        try:
+            from_chart = _lastfm_get_chart_top_tracks(api_key=lastfm_api_key, limit=fetch_limit)
+        except requests.RequestException:
+            from_chart = []
+        if from_chart:
+            similar_sources.append("chart.getTopTracks")
+            similar_tracks = _merge_unique_tracks(similar_tracks, from_chart, limit=fetch_limit)
+
+    # --- Filter out excluded tracks and trim to desired count ---
+    filtered: list[dict[str, Any]] = []
+    for t in similar_tracks:
+        key = _track_key(t)  # (artist.lower(), name.lower())
+        if key in exclude_keys:
+            continue
+        filtered.append(t)
+        if len(filtered) >= desired:
+            break
+    similar_tracks = filtered
+
+    similar_source = "merged" if len(similar_sources) > 1 else (similar_sources[0] if similar_sources else "none")
+
+    return jsonify({
+        "seed": {"artist": artist, "title": title, "playcount": playcount},
+        "lastfm": {
+            "similar_tracks": similar_tracks,
+            "similar_source": similar_source,
+            "similar_sources": similar_sources,
+            "top_tags": top_tags,
+            "query": {"artist": lastfm_artist, "track": lastfm_track},
+        },
+    })
+
+
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=5000, debug=True)
