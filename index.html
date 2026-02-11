@@ -563,19 +563,10 @@
         return payload;
       }
 
-      function renderResult(payload) {
-        const identified = payload && payload.identified ? payload.identified : null;
-        if (!identified) {
-          identifiedEl.textContent = '—';
-        } else {
-          const artist = identified.artist || 'Unknown artist';
-          const title = identified.title || 'Unknown title';
-          identifiedEl.textContent = `${artist} — ${title}`;
-        }
-
+      function renderRecsList(tracks) {
         recsEl.innerHTML = '';
-        const similar = payload && payload.lastfm && Array.isArray(payload.lastfm.similar_tracks) ? payload.lastfm.similar_tracks : [];
-        for (const t of similar) {
+        const list = Array.isArray(tracks) ? tracks : [];
+        for (const t of list) {
           const li = document.createElement('li');
           const name = t.name || 'Unknown track';
           const artist = t.artist || 'Unknown artist';
@@ -606,6 +597,20 @@
 
           recsEl.appendChild(li);
         }
+      }
+
+      function renderResult(payload) {
+        const identified = payload && payload.identified ? payload.identified : null;
+        if (!identified) {
+          identifiedEl.textContent = '—';
+        } else {
+          const artist = identified.artist || 'Unknown artist';
+          const title = identified.title || 'Unknown title';
+          identifiedEl.textContent = `${artist} — ${title}`;
+        }
+
+        const similar = payload && payload.lastfm && Array.isArray(payload.lastfm.similar_tracks) ? payload.lastfm.similar_tracks : [];
+        renderRecsList(similar);
 
         const tags = payload && payload.lastfm && Array.isArray(payload.lastfm.top_tags) ? payload.lastfm.top_tags : [];
         updateVibe(tags);
@@ -968,6 +973,7 @@
             if (!resp.ok) return;
 
             const recs = (data.lastfm && data.lastfm.similar_tracks) || [];
+            renderRecsList(recs);
             const newChildren = [];       // track which nodes are newly created
             const angle0 = Math.random() * Math.PI * 2;
             recs.forEach((t, i) => {
