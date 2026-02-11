@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import requests
@@ -37,6 +38,95 @@ def _pick_first_metadata(acr_response: dict[str, Any]) -> dict[str, Any] | None:
     return music[0]
 
 
+# Last.fm placeholder image hashes — these are generic default icons, not real art
+_LASTFM_PLACEHOLDER_HASHES = {
+    "2a96cbd8b46e442fc41c2b86b821562f",  # default star/track placeholder
+    "c6f59c1e5e7240a4c0d427abd71f3dbb",  # another known placeholder
+}
+
+
+def _is_placeholder(url: str) -> bool:
+    """Return True if a Last.fm image URL is actually their default placeholder."""
+    if not url:
+        return True
+    for h in _LASTFM_PLACEHOLDER_HASHES:
+        if h in url:
+            return True
+    return False
+
+
+def _pick_image(images: list) -> str:
+    """Extract the best image URL from a Last.fm image array.
+
+    Prefers 'extralarge' (index 3), falls back to 'large' (2), then first available.
+    Filters out Last.fm placeholder/default images.
+    """
+    if not images or not isinstance(images, list):
+        return ""
+    for preferred in ("extralarge", "large", "medium"):
+        for img in images:
+            if isinstance(img, dict) and img.get("size") == preferred and img.get("#text"):
+                url = img["#text"]
+                if not _is_placeholder(url):
+                    return url
+    # last resort: first non-empty, non-placeholder entry
+    for img in images:
+        if isinstance(img, dict) and img.get("#text"):
+            url = img["#text"]
+            if not _is_placeholder(url):
+                return url
+    return ""
+
+
+def _itunes_album_art(*, artist: str, track: str) -> str:
+    """Fallback album art via the free iTunes Search API (no key needed)."""
+    try:
+        resp = requests.get("https://itunes.apple.com/search", params={
+            "term": f"{artist} {track}",
+            "entity": "song",
+            "limit": "1",
+        }, timeout=8)
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+        if results:
+            art = results[0].get("artworkUrl100", "")
+            if art:
+                # Upscale from 100x100 to 600x600
+                return art.replace("100x100bb", "600x600bb")
+    except Exception:
+        pass
+    return ""
+
+
+def _enrich_images(tracks: list[dict[str, Any]]) -> None:
+    """Fill in missing/placeholder images for tracks using the iTunes Search API.
+
+    Runs lookups concurrently for speed.
+    """
+    to_fetch: list[tuple[int, str, str]] = []
+    for i, t in enumerate(tracks):
+        img = t.get("image") or ""
+        if img and not _is_placeholder(img):
+            continue
+        artist = t.get("artist") or ""
+        name = t.get("name") or ""
+        if artist or name:
+            t["image"] = ""  # clear placeholder
+            to_fetch.append((i, artist, name))
+
+    if not to_fetch:
+        return
+
+    def _fetch(item: tuple[int, str, str]) -> tuple[int, str]:
+        idx, artist, name = item
+        return idx, _itunes_album_art(artist=artist, track=name)
+
+    with ThreadPoolExecutor(max_workers=min(len(to_fetch), 5)) as pool:
+        for idx, url in pool.map(_fetch, to_fetch):
+            if url:
+                tracks[idx]["image"] = url
+
+
 def _lastfm_get_similar(*, artist: str, track: str, api_key: str, limit: int = 5) -> list[dict[str, Any]]:
     url = "https://ws.audioscrobbler.com/2.0/"
     params = {
@@ -64,6 +154,7 @@ def _lastfm_get_similar(*, artist: str, track: str, api_key: str, limit: int = 5
                 "artist": (t.get("artist") or {}).get("name") if isinstance(t.get("artist"), dict) else t.get("artist"),
                 "url": t.get("url"),
                 "match": t.get("match"),
+                "image": _pick_image(t.get("image", [])),
             }
         )
     return out
@@ -156,6 +247,7 @@ def _lastfm_get_similar_via_artist(*, artist: str, api_key: str, limit: int = 5)
                 "artist": a_name,
                 "url": t.get("url"),
                 "match": a.get("match"),
+                "image": _pick_image(t.get("image", [])),
             })
     return out
 
@@ -187,6 +279,7 @@ def _lastfm_get_similar_via_tags(*, tags: list[str], api_key: str, limit: int = 
             "artist": (t.get("artist") or {}).get("name") if isinstance(t.get("artist"), dict) else t.get("artist"),
             "url": t.get("url"),
             "match": None,
+            "image": _pick_image(t.get("image", [])),
         })
     return out
 
@@ -214,6 +307,7 @@ def _lastfm_get_chart_top_tracks(*, api_key: str, limit: int = 5) -> list[dict[s
             "artist": (t.get("artist") or {}).get("name") if isinstance(t.get("artist"), dict) else t.get("artist"),
             "url": t.get("url"),
             "match": None,
+            "image": _pick_image(t.get("image", [])),
         })
     return out
 
@@ -328,6 +422,32 @@ def identify():
     else:
         lastfm_tags_error = None
 
+    # --- Fetch album art + playcount for the identified track ---
+    identified_image = ""
+    identified_playcount = 0
+    try:
+        _info_resp = requests.get("https://ws.audioscrobbler.com/2.0/", params={
+            "method": "track.getInfo",
+            "artist": lastfm_artist,
+            "track": lastfm_track,
+            "api_key": lastfm_api_key,
+            "format": "json",
+            "autocorrect": "1",
+        }, timeout=15)
+        _info_resp.raise_for_status()
+        _info = _info_resp.json().get("track", {})
+        identified_playcount = int(_info.get("playcount", 0))
+    except Exception:
+        pass
+
+    # iTunes first (most accurate album art), Last.fm as fallback
+    identified_image = _itunes_album_art(artist=lastfm_artist, track=lastfm_track)
+    if not identified_image:
+        try:
+            identified_image = _pick_image((_info.get("album") or {}).get("image", []))
+        except Exception:
+            pass
+
     # --- Fetch recommendations using a merged strategy (up to 5 unique tracks) ---
     limit = 5
     similar_tracks: list[dict[str, Any]] = []
@@ -384,6 +504,9 @@ def identify():
     # Back-compat: keep a single field, but also expose detailed sources.
     similar_source = "merged" if len(similar_sources) > 1 else (similar_sources[0] if similar_sources else "none")
 
+    # Enrich similar tracks with album art from iTunes where Last.fm image is missing
+    _enrich_images(similar_tracks)
+
     result = {
         "identified": {
             "artist": identified_artist,
@@ -393,6 +516,8 @@ def identify():
             "duration_ms": first.get("duration_ms"),
             "score": first.get("score"),
             "acrid": first.get("acrid"),
+            "image": identified_image,
+            "playcount": identified_playcount,
         },
         "lastfm": {
             "similar_tracks": similar_tracks,
@@ -455,6 +580,7 @@ def recommend():
 
     # --- Playcount (used for star size in the constellation) ---
     playcount = None
+    seed_image = ""
     try:
         info_resp = requests.get("https://ws.audioscrobbler.com/2.0/", params={
             "method": "track.getInfo",
@@ -466,9 +592,19 @@ def recommend():
         }, timeout=15)
         info_resp.raise_for_status()
         info_payload = info_resp.json()
-        playcount = int(info_payload.get("track", {}).get("playcount", 0))
+        track_info = info_payload.get("track", {})
+        playcount = int(track_info.get("playcount", 0))
     except Exception:
         pass
+
+    # iTunes first (most accurate), Last.fm album image as fallback
+    seed_image = _itunes_album_art(artist=lastfm_artist, track=lastfm_track)
+    if not seed_image:
+        try:
+            album_images = (track_info.get("album") or {}).get("image", [])
+            seed_image = _pick_image(album_images)
+        except Exception:
+            pass
 
     # --- Similar tracks (merged strategy, over-fetch then filter) ---
     desired = 5
@@ -531,8 +667,11 @@ def recommend():
 
     similar_source = "merged" if len(similar_sources) > 1 else (similar_sources[0] if similar_sources else "none")
 
+    # Enrich similar tracks with album art from iTunes where Last.fm image is missing
+    _enrich_images(similar_tracks)
+
     return jsonify({
-        "seed": {"artist": artist, "title": title, "playcount": playcount},
+        "seed": {"artist": artist, "title": title, "playcount": playcount, "image": seed_image},
         "lastfm": {
             "similar_tracks": similar_tracks,
             "similar_source": similar_source,
@@ -544,4 +683,4 @@ def recommend():
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000, debug=True)
+    app.run(host="127.0.0.1", port=5001, debug=True)
