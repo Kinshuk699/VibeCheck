@@ -46,10 +46,13 @@ def _lastfm_get_similar(*, artist: str, track: str, api_key: str, limit: int = 5
         "api_key": api_key,
         "format": "json",
         "limit": str(limit),
+        "autocorrect": "1",
     }
     resp = requests.get(url, params=params, timeout=20)
     resp.raise_for_status()
     payload = resp.json()
+    if "error" in payload:
+        raise requests.HTTPError(f"Last.fm error {payload.get('error')}: {payload.get('message')}")
     tracks = payload.get("similartracks", {}).get("track", [])
     if isinstance(tracks, dict):
         tracks = [tracks]
@@ -66,6 +69,45 @@ def _lastfm_get_similar(*, artist: str, track: str, api_key: str, limit: int = 5
     return out
 
 
+def _track_key(track: dict[str, Any]) -> tuple[str, str]:
+    artist = (track.get("artist") or "")
+    name = (track.get("name") or "")
+    return (str(artist).strip().lower(), str(name).strip().lower())
+
+
+def _merge_unique_tracks(
+    base: list[dict[str, Any]],
+    incoming: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    out = list(base)
+    seen = {_track_key(t) for t in out}
+    for t in incoming:
+        if len(out) >= limit:
+            break
+        key = _track_key(t)
+        if key == ("", "") or key in seen:
+            continue
+        out.append(t)
+        seen.add(key)
+    return out
+
+
+def _normalize_lastfm_artist(artist: str) -> str:
+    # ACRCloud sometimes returns artist strings like "A/B/C" or "A & B".
+    # For Last.fm calls, prefer the primary artist.
+    s = str(artist or "").strip()
+    for sep in ["/", "&", ",", ";"]:
+        if sep in s:
+            s = s.split(sep, 1)[0].strip()
+    for token in [" feat. ", " feat ", " ft. ", " ft ", " featuring "]:
+        if token in s.lower():
+            idx = s.lower().find(token)
+            s = s[:idx].strip()
+    return s
+
+
 def _lastfm_get_similar_via_artist(*, artist: str, api_key: str, limit: int = 5) -> list[dict[str, Any]]:
     """Fallback 1: get similar *artists*, then pick their top track."""
     url = "https://ws.audioscrobbler.com/2.0/"
@@ -75,10 +117,13 @@ def _lastfm_get_similar_via_artist(*, artist: str, api_key: str, limit: int = 5)
         "api_key": api_key,
         "format": "json",
         "limit": str(limit),
+        "autocorrect": "1",
     }
     resp = requests.get(url, params=params, timeout=20)
     resp.raise_for_status()
     payload = resp.json()
+    if "error" in payload:
+        raise requests.HTTPError(f"Last.fm error {payload.get('error')}: {payload.get('message')}")
     artists = payload.get("similarartists", {}).get("artist", [])
     if isinstance(artists, dict):
         artists = [artists]
@@ -95,9 +140,12 @@ def _lastfm_get_similar_via_artist(*, artist: str, api_key: str, limit: int = 5)
             "api_key": api_key,
             "format": "json",
             "limit": "1",
+            "autocorrect": "1",
         }, timeout=15)
         tp.raise_for_status()
         tp_payload = tp.json()
+        if "error" in tp_payload:
+            continue
         top_tracks = tp_payload.get("toptracks", {}).get("track", [])
         if isinstance(top_tracks, dict):
             top_tracks = [top_tracks]
@@ -127,6 +175,35 @@ def _lastfm_get_similar_via_tags(*, tags: list[str], api_key: str, limit: int = 
     resp = requests.get(url, params=params, timeout=20)
     resp.raise_for_status()
     payload = resp.json()
+    if "error" in payload:
+        raise requests.HTTPError(f"Last.fm error {payload.get('error')}: {payload.get('message')}")
+    tracks = payload.get("tracks", {}).get("track", [])
+    if isinstance(tracks, dict):
+        tracks = [tracks]
+    out: list[dict[str, Any]] = []
+    for t in tracks[:limit]:
+        out.append({
+            "name": t.get("name"),
+            "artist": (t.get("artist") or {}).get("name") if isinstance(t.get("artist"), dict) else t.get("artist"),
+            "url": t.get("url"),
+            "match": None,
+        })
+    return out
+
+
+def _lastfm_get_chart_top_tracks(*, api_key: str, limit: int = 5) -> list[dict[str, Any]]:
+    url = "https://ws.audioscrobbler.com/2.0/"
+    params = {
+        "method": "chart.getTopTracks",
+        "api_key": api_key,
+        "format": "json",
+        "limit": str(limit),
+    }
+    resp = requests.get(url, params=params, timeout=20)
+    resp.raise_for_status()
+    payload = resp.json()
+    if "error" in payload:
+        raise requests.HTTPError(f"Last.fm error {payload.get('error')}: {payload.get('message')}")
     tracks = payload.get("tracks", {}).get("track", [])
     if isinstance(tracks, dict):
         tracks = [tracks]
@@ -149,10 +226,13 @@ def _lastfm_get_top_tags(*, artist: str, track: str, api_key: str, limit: int = 
         "track": track,
         "api_key": api_key,
         "format": "json",
+        "autocorrect": "1",
     }
     resp = requests.get(url, params=params, timeout=20)
     resp.raise_for_status()
     payload = resp.json()
+    if "error" in payload:
+        raise requests.HTTPError(f"Last.fm error {payload.get('error')}: {payload.get('message')}")
     tags = payload.get("toptags", {}).get("tag", [])
     if isinstance(tags, dict):
         tags = [tags]
@@ -235,40 +315,74 @@ def identify():
     if not identified_artist or not identified_title:
         return jsonify({"error": "acrcloud_missing_artist_or_title", "raw": acr_payload}), 502
 
+    # Normalize artist for Last.fm (ACRCloud may return multi-artist strings).
+    lastfm_artist = _normalize_lastfm_artist(str(identified_artist))
+    lastfm_track = str(identified_title).strip()
+
     # --- Fetch top tags first (needed for tag-based fallback) ---
     try:
-        top_tags = _lastfm_get_top_tags(artist=str(identified_artist), track=str(identified_title), api_key=lastfm_api_key, limit=3)
+        top_tags = _lastfm_get_top_tags(artist=lastfm_artist, track=lastfm_track, api_key=lastfm_api_key, limit=3)
     except requests.RequestException as e:
         top_tags = []
         lastfm_tags_error = str(e)
     else:
         lastfm_tags_error = None
 
-    # --- Fetch similar tracks with cascading fallbacks ---
-    similar_source = "track.getSimilar"
+    # --- Fetch recommendations using a merged strategy (up to 5 unique tracks) ---
+    limit = 5
+    similar_tracks: list[dict[str, Any]] = []
+    similar_sources: list[str] = []
+
+    # Strategy 1: track.getSimilar
     try:
-        similar_tracks = _lastfm_get_similar(artist=str(identified_artist), track=str(identified_title), api_key=lastfm_api_key, limit=5)
+        from_track = _lastfm_get_similar(artist=lastfm_artist, track=lastfm_track, api_key=lastfm_api_key, limit=limit)
     except requests.RequestException as e:
-        similar_tracks = []
+        from_track = []
         lastfm_similar_error = str(e)
     else:
         lastfm_similar_error = None
 
-    # Fallback 1: similar artists → their top tracks
-    if not similar_tracks:
-        similar_source = "artist.getSimilar"
-        try:
-            similar_tracks = _lastfm_get_similar_via_artist(artist=str(identified_artist), api_key=lastfm_api_key, limit=5)
-        except requests.RequestException:
-            similar_tracks = []
+    if from_track:
+        similar_sources.append("track.getSimilar")
+        similar_tracks = _merge_unique_tracks(similar_tracks, from_track, limit=limit)
 
-    # Fallback 2: tag-based top tracks
-    if not similar_tracks and top_tags:
-        similar_source = "tag.getTopTracks"
+    # Strategy 2: artist.getSimilar → top track per artist (fill remaining)
+    if len(similar_tracks) < limit:
         try:
-            similar_tracks = _lastfm_get_similar_via_tags(tags=top_tags, api_key=lastfm_api_key, limit=5)
+            from_artist = _lastfm_get_similar_via_artist(artist=lastfm_artist, api_key=lastfm_api_key, limit=limit)
         except requests.RequestException:
-            similar_tracks = []
+            from_artist = []
+        if from_artist:
+            similar_sources.append("artist.getSimilar")
+            similar_tracks = _merge_unique_tracks(similar_tracks, from_artist, limit=limit)
+
+    # Strategy 3: tag.getTopTracks (fill remaining; try tags in order)
+    if len(similar_tracks) < limit and top_tags:
+        tag_collected: list[dict[str, Any]] = []
+        for tag in top_tags:
+            if len(tag_collected) >= limit:
+                break
+            try:
+                from_tag = _lastfm_get_similar_via_tags(tags=[tag], api_key=lastfm_api_key, limit=limit)
+            except requests.RequestException:
+                continue
+            tag_collected = _merge_unique_tracks(tag_collected, from_tag, limit=limit)
+        if tag_collected:
+            similar_sources.append("tag.getTopTracks")
+            similar_tracks = _merge_unique_tracks(similar_tracks, tag_collected, limit=limit)
+
+    # Final fallback: chart.getTopTracks (guarantees some recommendations)
+    if len(similar_tracks) < limit:
+        try:
+            from_chart = _lastfm_get_chart_top_tracks(api_key=lastfm_api_key, limit=limit)
+        except requests.RequestException:
+            from_chart = []
+        if from_chart:
+            similar_sources.append("chart.getTopTracks")
+            similar_tracks = _merge_unique_tracks(similar_tracks, from_chart, limit=limit)
+
+    # Back-compat: keep a single field, but also expose detailed sources.
+    similar_source = "merged" if len(similar_sources) > 1 else (similar_sources[0] if similar_sources else "none")
 
     result = {
         "identified": {
@@ -283,7 +397,12 @@ def identify():
         "lastfm": {
             "similar_tracks": similar_tracks,
             "similar_source": similar_source,
+            "similar_sources": similar_sources,
             "top_tags": top_tags,
+            "query": {
+                "artist": lastfm_artist,
+                "track": lastfm_track,
+            },
             "errors": {
                 "similar": lastfm_similar_error,
                 "tags": lastfm_tags_error,
